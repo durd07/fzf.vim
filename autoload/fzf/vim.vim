@@ -351,14 +351,32 @@ function! s:execute_silent(cmd)
   silent keepjumps keepalt execute a:cmd
 endfunction
 
-function! s:action_for(key)
+" [key, [filename, [stay_on_edit: 0]]]
+function! s:action_for(key, ...)
   let Cmd = get(get(g:, 'fzf_action', s:default_action), a:key, '')
   let cmd = type(Cmd) == s:TYPE.string ? Cmd : ''
-  normal! m'
-  if len(cmd)
-    call s:execute_silent(cmd)
+
+  " See If the command is the default action that opens the selected file in
+  " the current window. i.e. :edit
+  let edit = stridx('edit', cmd) == 0 " empty, e, ed, ..
+
+  " If no extra argument is given, we just execute the command and ignore
+  " errors. e.g. E471: Argument required: tab drop
+  if !a:0
+    if !edit
+      normal! m'
+      silent! call s:execute_silent(cmd)
+    endif
+  else
+    " For the default edit action, we don't execute the action if the
+    " selected file is already opened in the current window, or we are
+    " instructed to stay on the current buffer.
+    let stay = edit && (a:0 > 1 && a:2 || fnamemodify(a:1, ':p') ==# expand('%:p'))
+    if !stay
+      normal! m'
+      call s:execute_silent((len(cmd) ? cmd : 'edit').' '.s:escape(a:1))
+    endif
   endif
-  return cmd
 endfunction
 
 function! s:open(target)
@@ -593,8 +611,11 @@ function! fzf#vim#_recent_files()
 endfunction
 
 function! s:history_source(type)
-  let max  = histnr(a:type)
-  let fmt  = s:yellow(' %'.len(string(max)).'d ', 'Number')
+  let max = histnr(a:type)
+  if max <= 0
+    return ['No entries']
+  endif
+  let fmt = s:yellow(' %'.len(string(max)).'d ', 'Number')
   let list = filter(map(range(1, max), 'histget(a:type, - v:val)'), '!empty(v:val)')
   return extend([' :: Press '.s:magenta('CTRL-E', 'Special').' to edit'],
     \ map(list, 'printf(fmt, len(list) - v:key)." ".v:val'))
@@ -789,10 +810,16 @@ function! fzf#vim#_buflisted_sorted()
   return sort(s:buflisted(), 's:sort_buffers')
 endfunction
 
+" [query (string)], [bufnrs (list)], [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#buffers(...)
   let [query, args] = (a:0 && type(a:1) == type('')) ?
         \ [a:1, a:000[1:]] : ['', a:000]
-  let sorted = fzf#vim#_buflisted_sorted()
+  if len(args) && type(args[0]) == s:TYPE.list
+    let [buffers; args] = args
+  else
+    let buffers = s:buflisted()
+  endif
+  let sorted = sort(buffers, 's:sort_buffers')
   let header_lines = '--header-lines=' . (bufnr('') == get(sorted, 0, 0) ? 1 : 0)
   let tabstop = len(max(sorted)) >= 4 ? 9 : 8
   return s:fzf('buffers', {
@@ -824,7 +851,7 @@ function! s:ag_handler(name, lines)
     return
   endif
 
-  call s:action_for(a:lines[0])
+  call s:action_for(a:lines[0], list[0].filename, len(list) > 1)
   if s:fill_quickfix(a:name, list)
     return
   endif
@@ -832,7 +859,6 @@ function! s:ag_handler(name, lines)
   " Single item selected
   let first = list[0]
   try
-    call s:open(first.filename)
     execute first.lnum
     if has_key(first, 'col')
       call cursor(0, first.col)
@@ -1001,18 +1027,29 @@ function! s:tags_sink(lines)
   if len(a:lines) < 2
     return
   endif
+
+  " Remember the current position
+  let buf = bufnr('')
+  let view = winsaveview()
+
   let qfl = []
-  call s:action_for(a:lines[0])
+  let [key; list] = a:lines
+
   try
     let [magic, &magic, wrapscan, &wrapscan, acd, &acd] = [&magic, 0, &wrapscan, 1, &acd, 0]
-    for line in a:lines[1:]
+    for line in list
       try
         let parts   = split(line, '\t\zs')
         let excmd   = matchstr(join(parts[2:-2], '')[:-2], '^.\{-}\ze;\?"\t')
         let base    = fnamemodify(parts[-1], ':h')
         let relpath = parts[1][:-2]
         let abspath = relpath =~ (s:is_win ? '^[A-Z]:\' : '^/') ? relpath : join([base, relpath], '/')
-        call s:open(expand(abspath, 1))
+
+        if len(list) == 1
+          call s:action_for(key, expand(abspath, 1))
+        else
+          call s:open(expand(abspath, 1))
+        endif
         call s:execute_silent(excmd)
         call add(qfl, {'filename': expand('%'), 'lnum': line('.'), 'text': getline('.')})
       catch /^Vim:Interrupt$/
@@ -1026,12 +1063,18 @@ function! s:tags_sink(lines)
   endtry
 
   if len(qfl) > 1
-    " Go back to the original position
-    normal! g`'
-    " Because 'listproc' will use 'cfirst' to go to the first item in the list
+    " Go back to the original position. Because 'listproc' will use 'cfirst'
+    " to go to the first item in the list.
+    call s:execute_silent('b '.buf)
+    call winrestview(view)
+
+    " However, if a non-default action is triggered, we need to open the first
+    " entry using the action, to be as backward compatible as possible.
+    call s:action_for(key, qfl[0].filename, 1)
+
     call s:fill_quickfix('tags', qfl)
   else
-    normal! zvzz
+    normal! ^zvzz
   endif
 endfunction
 
@@ -1067,8 +1110,9 @@ function! fzf#vim#tags(query, ...)
   endfor
   let opts = v2_limit < 0 ? ['--algo=v1'] : []
 
+  let args = insert(map(tagfiles, 'fzf#shellescape(fnamemodify(v:val, ":p"))'), fzf#shellescape(a:query), 0)
   return s:fzf('tags', {
-  \ 'source':  'perl '.fzf#shellescape(s:bin.tags).' '.join(map(tagfiles, 'fzf#shellescape(fnamemodify(v:val, ":p"))')),
+  \ 'source':  join(['perl', fzf#shellescape(s:bin.tags), join(args)]),
   \ 'sink*':   s:function('s:tags_sink'),
   \ 'options': extend(opts, ['--nth', '1..2', '-m', '-d', '\t', '--tiebreak=begin', '--prompt', 'Tags> ', '--query', a:query])}, a:000)
 endfunction
@@ -1165,6 +1209,62 @@ function! fzf#vim#commands(...)
 endfunction
 
 " ------------------------------------------------------------------
+" Changes
+" ------------------------------------------------------------------
+
+function! s:format_change(bufnr, offset, item)
+  return printf("%3d  %s  %4d  %3d  %s", a:bufnr, s:yellow(printf('%6s', a:offset)), a:item.lnum, a:item.col, getbufline(a:bufnr, a:item.lnum)[0])
+endfunction
+
+function! s:changes_sink(lines)
+  if len(a:lines) < 2
+    return
+  endif
+
+  call s:action_for(a:lines[0])
+  let [b, o, l, c] = split(a:lines[1])[0:3]
+
+  if o == '-'
+    execute 'buffer' b
+    call cursor(l, c)
+  elseif o[0] == '+'
+    execute 'normal!' o[1:].'g,'
+  else
+    execute 'normal!' o.'g;'
+  endif
+endfunction
+
+function! s:format_change_offset(current, index, cursor)
+  if !a:current
+    return '-'
+  endif
+
+  let offset = a:index - a:cursor + 1
+  if offset < 0
+    return '+'.-offset
+  endif
+  return offset
+endfunction
+
+function! fzf#vim#changes(...)
+  let all_changes = ["buf  offset  line  col  text"]
+  let cursor = 0
+  for bufnr in fzf#vim#_buflisted_sorted()
+    let [changes, position_or_length] = getchangelist(bufnr)
+    let current = bufnr('') == bufnr
+    if current
+      let cursor = len(changes) - position_or_length
+    endif
+    let all_changes += map(reverse(changes), { idx, val -> s:format_change(bufnr, s:format_change_offset(current, idx, cursor), val) })
+  endfor
+
+  return s:fzf('changes', {
+  \ 'source':  all_changes,
+  \ 'sink*':   s:function('s:changes_sink'),
+  \ 'options': printf('+m -x --ansi --tiebreak=index --header-lines=1 --cycle --scroll-off 999 --sync --bind start:pos:%d --prompt "Changes> "', cursor)}, a:000)
+endfunction
+
+" ------------------------------------------------------------------
 " Marks
 " ------------------------------------------------------------------
 function! s:format_mark(line)
@@ -1252,7 +1352,7 @@ function! fzf#vim#helptags(...)
   endif
   let s:helptags_script = tempname()
 
-  call writefile(['use Fatal qw(open close); for my $filename (@ARGV) { open(my $file,q(<),$filename); while (<$file>) { /(.*?)\t(.*?)\t(.*)/; push @lines, sprintf(qq('.s:green('%-40s', 'Label').'\t%s\t%s\t%s\n), $1, $2, $filename, $3); } close($file); } print for sort @lines;'], s:helptags_script)
+  call writefile(['for my $filename (@ARGV) { open(my $file,q(<),$filename) or die; while (<$file>) { /(.*?)\t(.*?)\t(.*)/; push @lines, sprintf(qq('.s:green('%-40s', 'Label').'\t%s\t%s\t%s\n), $1, $2, $filename, $3); } close($file) or die; } print for sort @lines;'], s:helptags_script)
   return s:fzf('helptags', {
   \ 'source': 'perl '.fzf#shellescape(s:helptags_script).' '.join(map(tags, 'fzf#shellescape(v:val)')),
   \ 'sink':    s:function('s:helptag_sink'),
@@ -1327,7 +1427,9 @@ function! s:commits_sink(lines)
   end
 
   let diff = a:lines[0] == 'ctrl-d'
-  let cmd = s:action_for(a:lines[0])
+  let Cmd = get(get(g:, 'fzf_action', s:default_action), a:lines[0], '')
+  let cmd = type(Cmd) == s:TYPE.string ? Cmd : ''
+
   let buf = bufnr('')
   for idx in range(1, len(a:lines) - 1)
     let sha = matchstr(a:lines[idx], pat)
